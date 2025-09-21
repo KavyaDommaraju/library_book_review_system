@@ -1,0 +1,494 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AR Book Review App (Prototype)</title>
+  <style>
+    :root{--panel-bg:rgba(255,255,255,0.94);--accent:#2b6cb0}
+    html,body{height:100%;font-family:Inter,Segoe UI,Arial;margin:0;background:#111}
+    #app{height:100%;display:flex;flex-direction:column}
+    header{padding:10px;color:white;background:#0b1220;display:flex;gap:12px;align-items:center}
+    header h1{font-size:16px;margin:0}
+    #videoWrap{position:relative;flex:1;display:flex;align-items:center;justify-content:center}
+    video#cam{width:100%;height:100%;object-fit:cover}
+
+    /* AR overlay */
+    canvas#debug{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+
+    .panel{position:absolute;background:var(--panel-bg);backdrop-filter:blur(6px);border-radius:10px;padding:10px;box-shadow:0 12px 40px rgba(0,0,0,0.6);width:300px;z-index:100;max-width:40vw}
+    .small-card{width:140px;padding:8px;margin:6px;border-radius:8px;background:#fffefc}
+
+    .title{font-weight:700;font-size:16px;color:#0b2540}
+    .meta{font-size:13px;color:#334155;margin-top:6px}
+    .rating{font-size:18px;color:#ffb020}
+    .controls{display:flex;gap:8px;align-items:center}
+    .btn{background:var(--accent);color:white;padding:8px 10px;border-radius:8px;border:none;cursor:pointer}
+    .btn.secondary{background:#6b7280}
+    #searchFallback{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,0.6);color:white;padding:8px;border-radius:8px}
+    form.review{display:flex;flex-direction:column;gap:6px}
+    textarea{resize:vertical}
+    footer{padding:8px;color:#94a3b8;font-size:12px;background:#071022}
+    .error{color:#ff4444;background:#ffe6e6;padding:8px;border-radius:6px;margin:8px 0}
+
+    /* reviews list inside panel */
+    .reviews-list{max-height:120px;overflow:auto;margin-top:6px}
+    .review-item{padding:6px;border-radius:6px;background:#f7fafc;margin-bottom:6px}
+    .floating-review{position:absolute;z-index:120;background:rgba(255,255,255,0.96);padding:6px;border-radius:8px;box-shadow:0 8px 20px rgba(0,0,0,0.5);}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>AR Book Review App — Prototype</h1>
+      <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+        <button id="ttsBtn" class="btn">🔊 Read Summary</button>
+        <button id="clearReviews" class="btn secondary">Clear Local Reviews</button>
+      </div>
+    </header>
+
+    <div id="videoWrap">
+      <video id="cam" autoplay muted playsinline></video>
+      <canvas id="debug"></canvas>
+
+      <!-- AR panels: positioned by JS next to detected rectangle -->
+      <div id="infoPanel" class="panel" style="display:none;">
+        <div id="errorMessage" class="error" style="display:none"></div>
+        <div class="title" id="bookTitle">Scanning...</div>
+        <div class="meta" id="bookAuthor"></div>
+        <div class="meta" id="bookGenre"></div>
+        <div class="rating" id="bookRating">★★★★☆</div>
+        <div class="meta" id="bookDesc" style="margin-top:8px;max-height:120px;overflow:auto"></div>
+        <hr>
+        <div id="similar" style="display:flex;gap:8px;flex-wrap:wrap"></div>
+        <hr>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div style="font-size:13px;font-weight:700">Local reviews</div>
+          <div id="avgLabel" style="font-size:13px;color:#334155">—</div>
+        </div>
+        <div class="reviews-list" id="reviewsList"></div>
+        <form id="reviewForm" class="review">
+          <label style="font-size:13px">Your rating</label>
+          <select id="userRating"><option>5</option><option>4</option><option>3</option><option>2</option><option>1</option></select>
+          <textarea id="userReview" rows="3" placeholder="Write a short review..."></textarea>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button type="button" id="saveReview" class="btn">Save Review</button>
+            <button type="button" id="viewReviews" class="btn secondary">Show Reviews</button>
+          </div>
+        </form>
+      </div>
+
+      <div id="searchFallback" style="display:none">
+        <input id="manualQuery" placeholder="No barcode found — type title/author" />
+        <button id="doManual" class="btn">Search</button>
+      </div>
+
+    </div>
+
+    <footer>Notes: This is a lightweight prototype. It looks for a rectangular object (book) and attempts to read ISBN via barcode. If found, it queries Google Books API. Uses localStorage for reviews and Web Speech API for TTS.</footer>
+  </div>
+
+<script src="https://unpkg.com/quagga/dist/quagga.min.js"></script>
+<script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCVLoaded()"></script>
+
+<script>
+const video = document.getElementById('cam');
+const canvas = document.getElementById('debug');
+const ctx = canvas.getContext('2d');
+const infoPanel = document.getElementById('infoPanel');
+const errorMessage = document.getElementById('errorMessage');
+const bookTitle = document.getElementById('bookTitle');
+const bookAuthor = document.getElementById('bookAuthor');
+const bookGenre = document.getElementById('bookGenre');
+const bookDesc = document.getElementById('bookDesc');
+const bookRating = document.getElementById('bookRating');
+const similarDiv = document.getElementById('similar');
+const searchFallback = document.getElementById('searchFallback');
+const manualQuery = document.getElementById('manualQuery');
+const doManual = document.getElementById('doManual');
+const ttsBtn = document.getElementById('ttsBtn');
+const saveReview = document.getElementById('saveReview');
+const viewReviews = document.getElementById('viewReviews');
+const clearReviews = document.getElementById('clearReviews');
+const reviewsList = document.getElementById('reviewsList');
+const avgLabel = document.getElementById('avgLabel');
+
+let vw=640, vh=480;
+let lastISBN = null;
+let opencvLoaded = false;
+let quaggaStarted = false;
+let debounceTimer = null;
+
+function showError(message) {
+  errorMessage.textContent = message;
+  errorMessage.style.display = 'block';
+  setTimeout(() => { errorMessage.style.display = 'none'; }, 5000);
+}
+
+function onOpenCVLoaded() {
+  console.log('OpenCV loaded successfully');
+  opencvLoaded = true;
+}
+
+async function startCamera() {
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error('Camera API not supported in this browser');
+    }
+    
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment' }
+    });
+    video.srcObject = stream;
+    
+    await new Promise((resolve) => {
+      video.onloadedmetadata = resolve;
+    });
+    
+    await video.play();
+    vw = video.videoWidth || vw;
+    vh = video.videoHeight || vh;
+    canvas.width = vw;
+    canvas.height = vh;
+    canvas.style.width = video.clientWidth + 'px';
+    canvas.style.height = video.clientHeight + 'px';
+    
+    requestAnimationFrame(processFrame);
+    startQuagga();
+    
+  } catch (error) {
+    showError(`Camera error: ${error.message}. Please ensure you're using HTTPS or localhost.`);
+    console.error('Camera error:', error);
+  }
+}
+
+function startQuagga() {
+  if (!navigator.mediaDevices) return;
+
+  Quagga.init({
+    inputStream: {
+      type: 'LiveStream',
+      constraints: { facingMode: 'environment' },
+      target: document.querySelector('#cam')
+    },
+    decoder: {
+      readers: ['ean_reader','ean_8_reader','upc_reader','code_128_reader']
+    },
+    locate: true
+  }, function(err) {
+    if (err) {
+      console.error("Quagga init error:", err);
+      showError('Barcode scanner initialization failed');
+      return;
+    }
+    Quagga.start();
+    quaggaStarted = true;
+    console.log("✅ Quagga started scanning...");
+  });
+
+  Quagga.onProcessed(function(result) {
+    // optional: draw candidate boxes from quagga so user sees detection area
+    // keep minimal logging
+  });
+
+  Quagga.onDetected(result => {
+    if (result && result.codeResult && result.codeResult.code) {
+      const code = result.codeResult.code;
+      // debounce to avoid repeated fetches
+      if (code && code !== lastISBN) {
+        lastISBN = code;
+        console.log('Detected barcode:', code);
+        fetchBookByISBN(code);
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => { lastISBN = null; }, 7000); // allow re-detect after 7s
+      }
+    }
+  });
+}
+
+function processFrame() {
+  if (video.readyState >= 2) {
+    ctx.clearRect(0, 0, vw, vh);
+    ctx.drawImage(video, 0, 0, vw, vh);
+
+    try {
+      if (opencvLoaded && typeof cv !== 'undefined') {
+        let src = cv.imread(canvas);
+        let gray = new cv.Mat();
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
+        cv.Canny(gray, gray, 50, 150);
+        
+        let contours = new cv.MatVector();
+        let hierarchy = new cv.Mat();
+        cv.findContours(gray, contours, hierarchy, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE);
+        
+        let maxArea = 0;
+        let best = null;
+        
+        for (let i = 0; i < contours.size(); i++) {
+          let cnt = contours.get(i);
+          let peri = cv.arcLength(cnt, true);
+          let approx = new cv.Mat();
+          cv.approxPolyDP(cnt, approx, 0.02 * peri, true);
+          
+          if (approx.rows === 4) {
+            const area = cv.contourArea(approx);
+            if (area > maxArea && area > (vw*vh)*0.02) { // threshold relative to frame
+              maxArea = area;
+              best = approx;
+            }
+          }
+          approx.delete();
+          cnt.delete();
+        }
+        
+        if (best) {
+          let corners = [];
+          for (let i = 0; i < 4; i++) {
+            corners.push({x: best.intAt(i, 0), y: best.intAt(i, 1)});
+          }
+          // draw polygon
+          ctx.lineWidth = 4;
+          ctx.strokeStyle = 'lime';
+          ctx.beginPath();
+          ctx.moveTo(corners[0].x, corners[0].y);
+          for (let i = 1; i < 4; i++) ctx.lineTo(corners[i].x, corners[i].y);
+          ctx.closePath();
+          ctx.stroke();
+          
+          positionPanel(corners);
+        } else {
+          // keep panel visible if we have data
+          if (!infoPanel.dataset.bookid) infoPanel.style.display = 'none';
+        }
+        
+        contours.delete();
+        hierarchy.delete();
+        src.delete();
+        gray.delete();
+      }
+    } catch (e) {
+      // OpenCV often throws during WASM initialization; ignore silently
+      // console.log('OpenCV processing error (normal during initialization):', e);
+    }
+  }
+  requestAnimationFrame(processFrame);
+}
+
+function positionPanel(corners) {
+  // compute bounding box in video coordinate space, then translate to CSS pixels
+  const bx = Math.min(...corners.map(p => p.x));
+  const by = Math.min(...corners.map(p => p.y));
+  const bw = Math.max(...corners.map(p => p.x)) - bx;
+  const bh = Math.max(...corners.map(p => p.y)) - by;
+
+  // account for scaling between canvas bitmap and displayed size
+  const scaleX = canvas.clientWidth / canvas.width;
+  const scaleY = canvas.clientHeight / canvas.height;
+
+  const left = Math.min(canvas.clientWidth - 320, bx * scaleX + bw * scaleX + 10);
+  const top = Math.max(8, by * scaleY);
+
+  infoPanel.style.display = 'block';
+  infoPanel.style.left = left + 'px';
+  infoPanel.style.top = top + 'px';
+}
+
+async function fetchBookByISBN(isbn) {
+  try {
+    const url = `https://www.googleapis.com/books/v1/volumes?q=isbn:${isbn}`;
+    const res = await fetch(url);
+    
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    
+    const data = await res.json();
+    if (data.totalItems > 0) {
+      populateBook(data.items[0]);
+    } else {
+      showError('No book found for ISBN ' + isbn);
+      // show manual fallback
+      searchFallback.style.display = 'block';
+    }
+  } catch (error) {
+    console.error('API fetch error:', error);
+    showError('Failed to fetch book information');
+  }
+}
+
+async function fetchBookByQuery(q) {
+  try {
+    const url = `https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=3`;
+    const res = await fetch(url);
+    
+    if (!res.ok) {
+      throw new Error(`HTTP error! status: ${res.status}`);
+    }
+    
+    const data = await res.json();
+    if (data.totalItems > 0) {
+      populateBook(data.items[0], data.items.slice(1, 3));
+      searchFallback.style.display = 'none';
+    } else {
+      showError('No results found');
+    }
+  } catch (error) {
+    console.error('API fetch error:', error);
+    showError('Failed to search for books');
+  }
+}
+
+function populateBook(item, similar = []) {
+  const info = item.volumeInfo || {};
+  const id = item.id || ('manual:' + (info.industryIdentifiers ? info.industryIdentifiers.map(i=>i.identifier).join('-') : Date.now()));
+  bookTitle.textContent = info.title || 'Unknown title';
+  bookAuthor.textContent = (info.authors || []).join(', ') || 'Unknown author';
+  bookGenre.textContent = (info.categories || []).join(', ') || 'Unknown genre';
+  bookRating.textContent = ratingStars(info.averageRating || 0) + ` (${info.ratingsCount || 0})`;
+  bookDesc.textContent = info.description ? stripHtml(info.description).slice(0, 800) : 'No description available.';
+
+  similarDiv.innerHTML = '';
+  (similar || []).forEach(it => {
+    const v = it.volumeInfo || {};
+    const card = document.createElement('div');
+    card.className = 'small-card';
+    card.innerHTML = `<div style="font-weight:700">${v.title || 'Unknown'}</div><div style="font-size:12px">${(v.authors||[])[0]||'Unknown author'}</div>`;
+    similarDiv.appendChild(card);
+  });
+  
+  infoPanel.style.display = 'block';
+  infoPanel.dataset.bookid = id;
+
+  // load and show stored reviews for this book
+  renderReviewsFor(id);
+}
+
+function ratingStars(r) {
+  r = Math.round(r || 0);
+  return '★'.repeat(r) + '☆'.repeat(5 - r);
+}
+
+function stripHtml(html) {
+  return (html || '').replace(/<[^>]*>/g, '');
+}
+
+// Review storage helpers
+function getAllReviews() {
+  return JSON.parse(localStorage.getItem('ar_book_reviews') || '{}');
+}
+
+function saveReviewFor(id, review) {
+  const all = getAllReviews();
+  all[id] = all[id] || [];
+  all[id].push(review);
+  localStorage.setItem('ar_book_reviews', JSON.stringify(all));
+}
+
+function renderReviewsFor(id) {
+  reviewsList.innerHTML = '';
+  const all = getAllReviews();
+  const arr = all[id] || [];
+  if (!arr.length) {
+    reviewsList.innerHTML = '<div style="color:#64748b;font-size:13px">No local reviews yet — be the first!</div>';
+    avgLabel.textContent = '—';
+    return;
+  }
+  let sum = 0;
+  arr.slice().reverse().forEach(a => {
+    sum += Number(a.rating || 0);
+    const item = document.createElement('div');
+    item.className = 'review-item';
+    item.innerHTML = `<div style="font-weight:700">${'★'.repeat(a.rating)}${'☆'.repeat(5-a.rating)}</div><div style="font-size:13px">${escapeHtml(a.text)}</div><div style="font-size:11px;color:#6b7280;margin-top:4px">${new Date(a.when).toLocaleString()}</div>`;
+    reviewsList.appendChild(item);
+  });
+  avgLabel.textContent = (sum / arr.length).toFixed(1) + ' / 5';
+}
+
+function escapeHtml(s){ return (s+'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;', '"':'&quot;',"'":"&#39;"}[c])); }
+
+// Event listeners
+
+doManual.addEventListener('click', () => {
+  const q = manualQuery.value.trim();
+  if (!q) {
+    showError('Please enter a search term');
+    return;
+  }
+  fetchBookByQuery(q);
+});
+
+ttsBtn.addEventListener('click', () => {
+  if (!('speechSynthesis' in window)) {
+    showError('Text-to-speech not supported in this browser');
+    return;
+  }
+  
+  const text = bookDesc.textContent || bookTitle.textContent;
+  if (!text) {
+    showError('No text to read');
+    return;
+  }
+  
+  const ut = new SpeechSynthesisUtterance(text);
+  ut.rate = 0.95;
+  ut.pitch = 1;
+  speechSynthesis.cancel();
+  speechSynthesis.speak(ut);
+});
+
+saveReview.addEventListener('click', () => {
+  const id = infoPanel.dataset.bookid || ('manual:' + (manualQuery.value || Date.now()));
+  const rating = Number(document.getElementById('userRating').value);
+  const text = document.getElementById('userReview').value.trim();
+  
+  if (!id) {
+    showError('No book selected');
+    return;
+  }
+  if (!text) {
+    showError('Please write a short review');
+    return;
+  }
+  
+  const review = { rating, text, when: Date.now() };
+  saveReviewFor(id, review);
+  renderReviewsFor(id);
+  document.getElementById('userReview').value = '';
+  alert('Review saved locally');
+});
+
+viewReviews.addEventListener('click', () => {
+  const id = infoPanel.dataset.bookid;
+  if (!id) {
+    showError('No book selected');
+    return;
+  }
+  // focus panel (already visible). We can also temporarily flash the panel background
+  infoPanel.style.boxShadow = '0 16px 60px rgba(0,0,0,0.75)';
+  setTimeout(()=>{ infoPanel.style.boxShadow='0 12px 40px rgba(0,0,0,0.6)'; }, 1200);
+});
+
+clearReviews.addEventListener('click', () => {
+  if (confirm('Clear all local reviews?')) {
+    localStorage.removeItem('ar_book_reviews');
+    // update UI
+    const id = infoPanel.dataset.bookid;
+    if (id) renderReviewsFor(id);
+    alert('All reviews cleared');
+  }
+});
+
+// Show fallback if no barcode detected for a while
+let noBarcodeTimer = setTimeout(() => {
+  if (!quaggaStarted) {
+    searchFallback.style.display = 'block';
+  }
+}, 8000);
+
+// Start the application
+startCamera();
+</script>
+</body>
+</html>
